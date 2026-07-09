@@ -70,10 +70,10 @@ TOOLS_DECLARATION = [
         "name": "get_recent_b20_tokens",
         "description": "Get the most recent B20 tokens launched on Base. Use when user asks for new launches, latest memes, or trending B20 tokens.",
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "limit": {"type": "integer", "description": "Number of tokens to return"},
-                "meme_only": {"type": "boolean", "description": "Only return likely meme tokens"}
+                "limit": {"type": "INTEGER", "description": "Number of tokens to return"},
+                "meme_only": {"type": "BOOLEAN", "description": "Only return likely meme tokens"}
             },
         },
     },
@@ -81,9 +81,9 @@ TOOLS_DECLARATION = [
         "name": "get_b20_risk_analysis",
         "description": "Perform deep on-chain risk analysis on a specific B20 token address. Critical for checking if admin/mint roles are renounced.",
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "address": {"type": "string", "description": "The B20 token contract address (starts with 0xb200...)"}
+                "address": {"type": "STRING", "description": "The B20 token contract address (starts with 0xb200...)"}
             },
             "required": ["address"]
         },
@@ -92,10 +92,10 @@ TOOLS_DECLARATION = [
         "name": "search_x_for_token",
         "description": "Search recent X/Twitter discussion and sentiment for a token or narrative.",
         "parameters": {
-            "type": "object",
+            "type": "OBJECT",
             "properties": {
-                "query": {"type": "string"},
-                "hours": {"type": "integer"}
+                "query": {"type": "STRING"},
+                "hours": {"type": "INTEGER"}
             },
             "required": ["query"]
         },
