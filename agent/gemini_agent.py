@@ -120,7 +120,7 @@ When user gives an address starting with 0xb200, always call get_b20_risk_analys
 
 def run_gemini_agent(user_query: str, stream: bool = True):
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",  # Fast and free tier friendly
+        model_name="gemini-2.5-flash",  # Fast and free tier friendly
         tools=TOOLS_DECLARATION,
         system_instruction=SYSTEM_PROMPT
     )
