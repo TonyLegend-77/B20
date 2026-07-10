@@ -69,6 +69,36 @@ def search_x_for_token(query: str, hours: int = 6) -> Dict:
         "note": "X integration coming soon. This is demo data."
     }
 
+def get_token_live_state(address: str, rpc_url: str = "https://mainnet.base.org") -> Dict:
+    """Get raw, real-time on-chain state for a B20 token: whether it's paused,
+    its supply cap, current total supply, and whether the zero address still
+    holds the admin role. Use this for quick "is it paused / is supply capped /
+    how much has been minted" style questions, as a lighter-weight alternative
+    to the full risk analysis.
+
+    Args:
+        address: The B20 token contract address (starts with 0xb200...).
+        rpc_url: Base RPC endpoint to use.
+    """
+    from backend.risk_scorer import get_b20_contract
+    from web3 import Web3
+
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    contract = get_b20_contract(w3, address)
+
+    try:
+        return {
+            "paused": contract.functions.paused().call(),
+            "supply_cap": contract.functions.supplyCap().call(),
+            "total_supply": contract.functions.totalSupply().call(),
+            "admin_has_role_zero": contract.functions.hasRole(
+                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "0x0000000000000000000000000000000000000000"
+            ).call(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 # ============== SYSTEM PROMPT ==============
 
 SYSTEM_PROMPT = """You are B20 Pulse, an expert on-chain analyst for Base's new B20 Native Token Standard.
@@ -76,11 +106,18 @@ SYSTEM_PROMPT = """You are B20 Pulse, an expert on-chain analyst for Base's new 
 Core principles:
 - Always prioritize issuer control risk (admin role, mint role, paused, transfer policies, freeze/seize capability).
 - B20 was built for compliance assets. Many memes are using it — be transparent about remaining creator powers.
-- Use tools to get real data before answering.
+- Use tools to get real data before answering. Never guess or answer from memory when a tool can give a real answer.
 - Be direct, data-driven, and slightly skeptical of hype.
 - Never give financial advice. Frame as probabilities and on-chain facts.
 
-When user gives an address starting with 0xb200, always call get_b20_risk_analysis first.
+Call tools proactively whenever the user's message matches these patterns, even if not phrased as an explicit command:
+
+- Any message containing a token address (starts with 0xb200) → call get_b20_risk_analysis first. If they only ask something narrow like "is it paused" or "what's the supply", use get_token_live_state instead.
+- "new launches", "latest tokens", "what's new", "recent memes", "trending" → call get_recent_b20_tokens.
+- "is this safe", "rug pull", "can they rug", "renounced", "admin role", "mint role", "who controls this", "red flags" → call get_b20_risk_analysis.
+- "paused", "supply cap", "how much minted", "circulating supply" → call get_token_live_state.
+- "twitter", "x post", "sentiment", "hype", "buzz", "what are people saying" → call search_x_for_token.
+- If the user's intent is ambiguous but includes an address, default to calling get_b20_risk_analysis — it's better to over-fetch real data than answer without it.
 """
 
 MODEL_NAME = "gemini-2.5-flash"
@@ -92,7 +129,7 @@ def run_gemini_agent(user_query: str, stream: bool = True):
         model=MODEL_NAME,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            tools=[get_recent_b20_tokens, get_b20_risk_analysis, search_x_for_token],
+            tools=[get_recent_b20_tokens, get_b20_risk_analysis, search_x_for_token, get_token_live_state],
         ),
     )
 
