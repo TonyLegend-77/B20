@@ -21,7 +21,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 # Import our modules
-from .risk_scorer import get_risk_score
+from .risk_scorer import get_risk_score, get_light_state
 from scanner.b20_scanner import get_web3, scan_historical, save_output
 
 # Where the scanner writes its output — resolved relative to this file,
@@ -194,6 +194,35 @@ def get_recent_tokens(limit: int = 20, meme_only: bool = False):
 
     return tokens[:limit]
 
+def _lookup_creator_address(address: str) -> Optional[str]:
+    """Look up a token's deployer from the scanner's cached output, if we
+    saw its creation. Needed because B20 renunciation removes
+    DEFAULT_ADMIN_ROLE/MINT_ROLE from the creator outright rather than
+    reassigning them to address(0) — hasRole can only be checked against a
+    specific known address, and the scanner is the only place that recorded
+    who that was."""
+    if not SCANNER_OUTPUT_PATH.exists():
+        return None
+    try:
+        with open(SCANNER_OUTPUT_PATH) as f:
+            raw_tokens = json.load(f)
+    except Exception:
+        return None
+    target = address.lower()
+    for t in raw_tokens:
+        if t.get("token_address", "").lower() == target:
+            return t.get("deployer")
+    return None
+
+
+def analyze_token_risk_sync(address: str, rpc_url: str = "https://mainnet.base.org") -> dict:
+    """Plain sync function — actual logic lives here so it can be called
+    directly from both the FastAPI route below and the Gemini agent's tool
+    calls, same pattern as get_recent_tokens()."""
+    creator = _lookup_creator_address(address)
+    return get_risk_score(address, creator_address=creator, rpc_url=rpc_url)
+
+
 @app.get("/tokens/{address}/risk", response_model=RiskAnalysisResponse)
 async def analyze_token_risk(
     address: str,
@@ -203,7 +232,7 @@ async def analyze_token_risk(
     Runs full on-chain risk analysis for a B20 token.
     This is the core intelligence of B20 Pulse.
     """
-    result = get_risk_score(address, rpc_url=rpc)
+    result = analyze_token_risk_sync(address, rpc_url=rpc)
     
     if "error" in result:
         return {
@@ -218,25 +247,11 @@ async def analyze_token_risk(
 
 @app.get("/tokens/{address}/state")
 async def get_token_state(address: str, rpc: str = "https://mainnet.base.org"):
-    """Lightweight endpoint that returns raw on-chain state."""
-    from .risk_scorer import get_b20_contract
-    from web3 import Web3
-    
-    w3 = Web3(Web3.HTTPProvider(rpc))
-    contract = get_b20_contract(w3, address)
-    
-    try:
-        return {
-            "paused": contract.functions.paused().call(),
-            "supply_cap": contract.functions.supplyCap().call(),
-            "total_supply": contract.functions.totalSupply().call(),
-            "admin_has_role_zero": contract.functions.hasRole(
-                "0x0000000000000000000000000000000000000000000000000000000000000000", 
-                "0x0000000000000000000000000000000000000000"
-            ).call(),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    """Lightweight endpoint that returns raw on-chain state (paused features,
+    supply cap, total supply). Delegates to risk_scorer.get_light_state so
+    there's one source of truth for the B20 ABI instead of a second
+    hand-rolled copy of it here."""
+    return get_light_state(address, rpc_url=rpc)
 
 # TODO: Add endpoint for X sentiment once integrated
 # TODO: Add WebSocket or polling endpoint for live new token alerts
