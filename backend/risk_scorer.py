@@ -1,39 +1,40 @@
 """
 B20 Pulse — Real On-Chain Risk Scorer
 
-This module queries live B20 token state using web3.py and the IB20 interface.
-It evaluates issuer control risk (the most important factor for B20 tokens).
+Queries live B20 token state using web3.py against the real IB20 interface
+(docs.base.org/base-chain/specs/upgrades/beryl/b20, ABI confirmed against
+github.com/base/base-std/blob/main/src/interfaces/IB20.sol).
 
-Key things it checks:
-- Whether critical roles (DEFAULT_ADMIN_ROLE, MINT_ROLE) are still held by the creator
-- If the token is paused
-- Active transfer / mint policies
-- Supply cap status
+Important B20-specific behavior this module relies on:
+- Pause state is granular (TRANSFER/MINT/BURN). There is NO niladic
+  `paused()` — only `pausedFeatures()` / `isPaused(feature)`.
+- Renunciation removes DEFAULT_ADMIN_ROLE / MINT_ROLE outright via
+  `renounceLastAdmin()` (or by never granting it). It is NEVER reassigned
+  to address(0), unlike the common OZ AccessControl pattern. The only
+  reliable way to check "is this renounced" is `hasRole(role, <the address
+  that used to hold it>)` — so renunciation checks require a known creator
+  address, not the zero address.
+- Role constants (MINT_ROLE, BURN_BLOCKED_ROLE, etc.) are read live from the
+  token via their getter functions rather than recomputed locally, since
+  B20Constants.sol is the only authority for their actual values.
+- Scopes are read via `policyId(scope)`, not `getPolicy(scope)`.
+- The "uncapped" supply sentinel is `type(uint128).max`, not
+  `type(uint256).max`.
 
 Run this standalone or import from FastAPI / agent.
 """
 
 from web3 import Web3
-from eth_utils import keccak, to_checksum_address
+from eth_utils import to_checksum_address
 from typing import Dict, Any, Optional
-import os
 
-# Standard role hashes (from OpenZeppelin AccessControl + B20 extensions)
-DEFAULT_ADMIN_ROLE = "0x0000000000000000000000000000000000000000000000000000000000000000"
-MINT_ROLE = keccak(text="MINT_ROLE").hex()
-BURN_ROLE = keccak(text="BURN_ROLE").hex()
-PAUSE_ROLE = keccak(text="PAUSE_ROLE").hex()
-
-# Minimal ABI for the parts we care about (B20 is ERC20 superset + compliance features)
+# Minimal ABI for the parts we care about, matching IB20.sol exactly.
 B20_ABI = [
-    # Roles (AccessControl)
-    {
-        "inputs": [{"internalType": "bytes32", "name": "role", "type": "bytes32"}],
-        "name": "getRoleAdmin",
-        "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
+    # Role constant getters (IB20.sol "ROLE CONSTANTS") — call these instead
+    # of assuming a naive keccak256(name) hash.
+    {"inputs": [], "name": "DEFAULT_ADMIN_ROLE", "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "MINT_ROLE", "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}], "stateMutability": "view", "type": "function"},
+    # AccessControl
     {
         "inputs": [
             {"internalType": "bytes32", "name": "role", "type": "bytes32"},
@@ -44,59 +45,30 @@ B20_ABI = [
         "stateMutability": "view",
         "type": "function"
     },
-    # Pausable
-    {
-        "inputs": [],
-        "name": "paused",
-        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
+    # Pause — granular. No niladic paused().
+    {"inputs": [], "name": "pausedFeatures", "outputs": [{"internalType": "uint8[]", "name": "", "type": "uint8[]"}], "stateMutability": "view", "type": "function"},
     # Supply
-    {
-        "inputs": [],
-        "name": "supplyCap",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "totalSupply",
-        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    # B20 specific - Policies & Freeze/Seize
+    {"inputs": [], "name": "supplyCap", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "totalSupply", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
+    # Policy — scopes are read via policyId(scope), NOT getPolicy(scope).
     {
         "inputs": [{"internalType": "bytes32", "name": "policyScope", "type": "bytes32"}],
-        "name": "getPolicy",
+        "name": "policyId",
         "outputs": [{"internalType": "uint64", "name": "", "type": "uint64"}],
         "stateMutability": "view",
         "type": "function"
     },
-    {
-        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
-        "name": "isFrozen",
-        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "TRANSFER_SENDER_POLICY",
-        "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
-    {
-        "inputs": [],
-        "name": "TRANSFER_RECEIVER_POLICY",
-        "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
-        "stateMutability": "view",
-        "type": "function"
-    },
+    {"inputs": [], "name": "TRANSFER_SENDER_POLICY", "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [], "name": "TRANSFER_RECEIVER_POLICY", "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}], "stateMutability": "view", "type": "function"},
 ]
+
+# PausableFeature enum order per IB20.sol: TRANSFER=0, MINT=1, BURN=2.
+PAUSABLE_FEATURE_NAMES = {0: "TRANSFER", 1: "MINT", 2: "BURN"}
+
+# Per spec: the sentinel meaning "no cap" is type(uint128).max, NOT
+# type(uint256).max — supplyCap can never exceed uint128 max in the first place.
+UNCAPPED_SENTINEL = (2 ** 128) - 1
+
 
 def get_b20_contract(w3: Web3, token_address: str):
     return w3.eth.contract(
@@ -104,15 +76,45 @@ def get_b20_contract(w3: Web3, token_address: str):
         abi=B20_ABI
     )
 
-def check_role(contract, role: str, account: str) -> bool:
+
+def check_role(contract, role: bytes, account: str) -> Optional[bool]:
+    """Returns True/False for a real answer, or None if the call itself
+    failed (so callers can tell "confirmed no" apart from "couldn't check")."""
     try:
         return contract.functions.hasRole(role, to_checksum_address(account)).call()
     except Exception:
-        return False
+        return None
+
+
+def get_light_state(token_address: str, rpc_url: str = "https://mainnet.base.org") -> Dict[str, Any]:
+    """Lightweight read for quick "is it paused / what's the supply" questions.
+    No role/renunciation check here — that requires a creator address, see
+    get_risk_score. Shared by the FastAPI /state route and the Gemini agent's
+    get_token_live_state tool so there's one source of truth for the ABI.
+    """
+    w3 = Web3(Web3.HTTPProvider(rpc_url))
+    contract = get_b20_contract(w3, token_address)
+    try:
+        paused_features = contract.functions.pausedFeatures().call()
+        return {
+            "paused_features": [PAUSABLE_FEATURE_NAMES.get(f, str(f)) for f in paused_features],
+            "supply_cap": contract.functions.supplyCap().call(),
+            "total_supply": contract.functions.totalSupply().call(),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def get_risk_score(token_address: str, creator_address: Optional[str] = None, rpc_url: str = "https://mainnet.base.org") -> Dict[str, Any]:
     """
     Main function: returns detailed risk assessment for a B20 token.
+
+    creator_address, when known (e.g. resolved from the scanner's recorded
+    deployer for this token), lets us actually check whether admin/mint
+    roles have been renounced. Without it, renunciation is reported as
+    unknown rather than guessed — B20 has no role-enumeration extension, so
+    there is no way to check "does anyone hold this role" without a specific
+    address to test.
     """
     w3 = Web3(Web3.HTTPProvider(rpc_url))
     if not w3.is_connected():
@@ -129,12 +131,15 @@ def get_risk_score(token_address: str, creator_address: Optional[str] = None, rp
     }
 
     try:
-        # 1. Check if paused
-        paused = contract.functions.paused().call()
-        result["details"]["paused"] = paused
-        if paused:
-            result["reasons"].append("Token is currently PAUSED")
+        # 1. Pause state (granular)
+        paused_features = contract.functions.pausedFeatures().call()
+        paused_names = [PAUSABLE_FEATURE_NAMES.get(f, str(f)) for f in paused_features]
+        result["details"]["paused_features"] = paused_names
+        if 0 in paused_features:  # TRANSFER paused
+            result["reasons"].append("Transfers are currently PAUSED")
             result["risk_score"] -= 25
+        if 1 in paused_features:  # MINT paused
+            result["reasons"].append("Minting is currently paused")
 
         # 2. Check supply cap
         try:
@@ -142,67 +147,77 @@ def get_risk_score(token_address: str, creator_address: Optional[str] = None, rp
             total_supply = contract.functions.totalSupply().call()
             result["details"]["supply_cap"] = supply_cap
             result["details"]["total_supply"] = total_supply
-            if supply_cap == 2**256 - 1:  # uint256 max = unlimited
+            if supply_cap == UNCAPPED_SENTINEL:
                 result["reasons"].append("No supply cap (unlimited minting possible)")
                 result["risk_score"] -= 15
             else:
                 result["reasons"].append(f"Supply capped at {supply_cap}")
                 result["risk_score"] += 10
-        except:
+        except Exception:
             result["reasons"].append("Could not read supply cap")
 
-        # 3. Check critical roles (most important for B20 memes)
-        # We check if the zero address or a known creator still has powerful roles
-        zero_address = "0x0000000000000000000000000000000000000000"
+        # 3. Admin / mint role renunciation.
+        # B20 removes these roles outright on renunciation rather than
+        # reassigning to address(0), so this can only be checked against a
+        # known former holder (the creator) — never the zero address.
+        admin_role = contract.functions.DEFAULT_ADMIN_ROLE().call()
+        mint_role = contract.functions.MINT_ROLE().call()
 
-        admin_has_role = check_role(contract, DEFAULT_ADMIN_ROLE, zero_address)
-        mint_has_role = check_role(contract, MINT_ROLE, zero_address)
+        if creator_address:
+            creator_has_admin = check_role(contract, admin_role, creator_address)
+            creator_has_mint = check_role(contract, mint_role, creator_address)
 
-        result["details"]["admin_renounced"] = admin_has_role   # True if renounced (role given to zero)
-        result["details"]["mint_renounced"] = mint_has_role
+            result["details"]["admin_renounced"] = (creator_has_admin is False)
+            result["details"]["mint_renounced"] = (creator_has_mint is False)
 
-        if not admin_has_role:
-            result["reasons"].append("DEFAULT_ADMIN_ROLE still held by creator → HIGH RISK")
-            result["risk_score"] -= 30
-        else:
-            result["reasons"].append("Admin role renounced (good)")
-            result["risk_score"] += 20
-
-        if not mint_has_role:
-            result["reasons"].append("MINT_ROLE still held by creator → can mint more tokens")
-            result["risk_score"] -= 25
-        else:
-            result["reasons"].append("Mint role renounced (good)")
-            result["risk_score"] += 15
-
-        # 4. Check for active policies (transfer gating) - B20 specific
-        try:
-            sender_policy = contract.functions.getPolicy(contract.functions.TRANSFER_SENDER_POLICY().call()).call()
-            receiver_policy = contract.functions.getPolicy(contract.functions.TRANSFER_RECEIVER_POLICY().call()).call()
-
-            if sender_policy != 0 or receiver_policy != 0:
-                result["reasons"].append("Active transfer policies detected (issuer can block sends/receives)")
-                result["risk_score"] -= 18
-                result["details"]["has_transfer_policies"] = True
+            if creator_has_admin is True:
+                result["reasons"].append("DEFAULT_ADMIN_ROLE still held by creator → HIGH RISK")
+                result["risk_score"] -= 30
+            elif creator_has_admin is False:
+                result["reasons"].append("Admin role renounced by creator (good)")
+                result["risk_score"] += 20
             else:
-                result["details"]["has_transfer_policies"] = False
+                result["reasons"].append("Could not verify admin role status")
+
+            if creator_has_mint is True:
+                result["reasons"].append("MINT_ROLE still held by creator → can mint more tokens")
+                result["risk_score"] -= 25
+            elif creator_has_mint is False:
+                result["reasons"].append("Mint role renounced by creator (good)")
+                result["risk_score"] += 15
+            else:
+                result["reasons"].append("Could not verify mint role status")
+
+            if result["details"].get("admin_renounced") and result["details"].get("mint_renounced"):
+                result["reasons"].append("Strong signal: creator holds neither admin nor mint role")
+                result["risk_score"] += 10
+        else:
+            result["details"]["admin_renounced"] = "unknown"
+            result["details"]["mint_renounced"] = "unknown"
+            result["reasons"].append("Creator address not available — cannot verify role renunciation")
+
+        # 4. Check for active transfer policy gating (B20 specific)
+        try:
+            sender_scope = contract.functions.TRANSFER_SENDER_POLICY().call()
+            receiver_scope = contract.functions.TRANSFER_RECEIVER_POLICY().call()
+            sender_policy = contract.functions.policyId(sender_scope).call()
+            receiver_policy = contract.functions.policyId(receiver_scope).call()
+
+            has_policies = sender_policy != 0 or receiver_policy != 0
+            result["details"]["has_transfer_policies"] = has_policies
+            if has_policies:
+                result["reasons"].append("Active transfer policy configured (issuer can gate sends/receives)")
+                result["risk_score"] -= 18
         except Exception:
             result["details"]["has_transfer_policies"] = "unknown"
 
-        # 5. Check freeze/seize capability (very important for B20 compliance tokens)
-        try:
-            is_frozen_example = contract.functions.isFrozen("0x0000000000000000000000000000000000000000").call()
-            result["details"]["freeze_capability"] = True  # If function exists, issuer likely has freeze power
-            result["reasons"].append("Freeze/Seize capability present (common in B20 for regulated assets)")
-            result["risk_score"] -= 10  # Slight penalty for memes unless renounced
-        except:
-            result["details"]["freeze_capability"] = False
-
-        # 6. Bonus: Check if creator wallet has renounced in recent blocks (simplified)
-        # In production: Index creation tx + renounce events from the same creator
-        if result["details"].get("admin_renounced") and result["details"].get("mint_renounced"):
-            result["reasons"].append("Strong signal: Both admin and mint roles renounced at/near creation")
-            result["risk_score"] += 10
+        # 5. Freeze/seize capability is inherent to every B20 token
+        # (burnBlocked() gated by BURN_BLOCKED_ROLE) — it's part of the base
+        # standard, not something individual tokens opt into, so there's
+        # nothing to "detect" here. What actually varies is whether a
+        # transfer policy (checked above) is configured, since that's the
+        # practical precondition for burnBlocked to matter.
+        result["details"]["freeze_seize_capability"] = "inherent to B20 standard (burnBlocked / BURN_BLOCKED_ROLE)"
 
         # Final normalization
         result["risk_score"] = max(0, min(100, result["risk_score"]))
