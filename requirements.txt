@@ -3,4 +3,4 @@ uvicorn[standard]
 pydantic
 web3
 eth-utils
-google-generativeai
+google-genai
