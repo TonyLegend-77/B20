@@ -79,6 +79,9 @@ class B20Token:
     name: str
     symbol: str
     decimals: int
+    deployer: str          # tx["from"] on the createB20 call — needed later
+                            # to check DEFAULT_ADMIN_ROLE/MINT_ROLE renunciation,
+                            # since B20 never reassigns those roles to address(0)
     is_likely_meme: bool
     meme_score: int       # 0-100 rough score
     basescan_url: str
@@ -167,6 +170,7 @@ def decode_b20_creation_tx(tx: dict, receipt: dict, w3: Web3, block_timestamp: i
             name=name,
             symbol=symbol,
             decimals=decimals,
+            deployer=Web3.to_checksum_address(deployer),
             is_likely_meme=is_meme,
             meme_score=meme_score,
             basescan_url=f"{BASESCAN_TOKEN}{token_address}",
