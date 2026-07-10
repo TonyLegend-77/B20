@@ -5,27 +5,25 @@ Serves:
 - Recent B20 tokens (from scanner or cache)
 - Detailed on-chain risk analysis for any B20 token
 - Simple health check
-
-Run with:
-    uvicorn backend.main:app --reload --port 8000
 """
 
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+import os
 import json
 import threading
 import time
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+
 # Import our modules
 from .risk_scorer import get_risk_score, get_light_state
-from scanner.b20_scanner import get_web3, scan_historical, save_output
 
-# Where the scanner writes its output — resolved relative to this file,
-# NOT to whatever directory the process happens to be started from.
+# Scanner output path
 SCANNER_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "scanner" / "b20_output"
 SCANNER_OUTPUT_PATH = SCANNER_OUTPUT_DIR / "b20_tokens.json"
 
@@ -35,10 +33,11 @@ app = FastAPI(
     version="0.1.0"
 )
 
-# CORS for Mini App / local dev
+# CORS — configurable via env var
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,8 +64,7 @@ def _humanize_age(timestamp_str: str) -> str:
 
 
 def _transform_scanner_token(raw: dict) -> dict:
-    """Map the scanner's raw B20Token shape into the TokenResponse shape
-    the frontend/API contract expects."""
+    """Map scanner's raw B20Token shape into TokenResponse shape."""
     return {
         "address": raw.get("token_address", ""),
         "name": raw.get("name", "Unknown"),
@@ -74,16 +72,23 @@ def _transform_scanner_token(raw: dict) -> dict:
         "variant": raw.get("variant", "ASSET"),
         "age": _humanize_age(raw.get("timestamp", "")),
         "meme_score": raw.get("meme_score", 0),
-        "risk_level": "UNKNOWN",  # run /tokens/{address}/risk for the real read
+        "risk_level": "UNKNOWN",
         "liquidity": None,
     }
 
 
-def _run_background_scanner(rpc_url: str = "https://mainnet.base.org", catch_up_blocks: int = 5000, poll_interval: int = 15):
-    """Runs forever in a background thread: does an initial historical
-    catch-up, then polls for new blocks, writing results to SCANNER_OUTPUT_PATH
-    so /tokens/recent has real data instead of only ever falling back to mock."""
+def _run_background_scanner(
+    rpc_url: str = "https://mainnet.base.org",
+    catch_up_blocks: int = 5000,
+    poll_interval: int = 15
+):
+    """
+    Background thread: initial historical catch-up, then polls for new blocks.
+    Safely handles errors and never crashes the thread.
+    """
     try:
+        # Lazy import to avoid startup dependency issues
+        from scanner.b20_scanner import get_web3, scan_historical, save_output
         w3 = get_web3(rpc_url)
     except Exception as e:
         print(f"[scanner] Could not connect to RPC, background scanner disabled: {e}")
@@ -92,36 +97,58 @@ def _run_background_scanner(rpc_url: str = "https://mainnet.base.org", catch_up_
     print(f"[scanner] Connected to Base (chainId: {w3.eth.chain_id}). Starting background scan.")
 
     all_tokens = []
-    try:
-        current_block = w3.eth.block_number
-        from_block = max(1, current_block - catch_up_blocks)
-        all_tokens = scan_historical(w3, from_block, current_block)
-        save_output(all_tokens, SCANNER_OUTPUT_DIR)
-        print(f"[scanner] Initial catch-up found {len(all_tokens)} tokens.")
-        last_block = current_block
-    except Exception as e:
-        print(f"[scanner] Initial catch-up failed: {e}")
-        last_block = w3.eth.block_number
+    last_block = w3.eth.block_number
 
+    # Initial catch-up with retry
+    for attempt in range(3):
+        try:
+            current_block = w3.eth.block_number
+            from_block = max(1, current_block - catch_up_blocks)
+            all_tokens = scan_historical(w3, from_block, current_block)
+            save_output(all_tokens, SCANNER_OUTPUT_DIR)
+            print(f"[scanner] Initial catch-up found {len(all_tokens)} tokens.")
+            last_block = current_block
+            break
+        except Exception as e:
+            print(f"[scanner] Initial catch-up attempt {attempt + 1} failed: {e}")
+            if attempt == 2:
+                print("[scanner] Giving up on initial catch-up. Will try again in poll loop.")
+            time.sleep(5)
+
+    # Poll loop
     while True:
         try:
             current_block = w3.eth.block_number
             if current_block > last_block:
-                new_tokens = scan_historical(w3, last_block + 1, current_block)
+                # Prevent huge gap scans (e.g., after long downtime)
+                scan_from = max(last_block + 1, current_block - 100)
+                new_tokens = scan_historical(w3, scan_from, current_block)
                 if new_tokens:
-                    all_tokens = new_tokens + all_tokens  # newest first
+                    all_tokens = new_tokens + all_tokens
                     save_output(all_tokens, SCANNER_OUTPUT_DIR)
                     print(f"[scanner] Found {len(new_tokens)} new token(s) at block {current_block}.")
                 last_block = current_block
         except Exception as e:
             print(f"[scanner] Error in poll loop: {e}")
+            traceback.print_exc()
         time.sleep(poll_interval)
 
 
 @app.on_event("startup")
 def start_background_scanner():
-    thread = threading.Thread(target=_run_background_scanner, daemon=True)
+    """Start the background scanner in a daemon thread."""
+    thread = threading.Thread(
+        target=_run_background_scanner,
+        kwargs={
+            "rpc_url": os.getenv("RPC_URL", "https://mainnet.base.org"),
+            "catch_up_blocks": int(os.getenv("SCAN_CATCH_UP_BLOCKS", "5000")),
+            "poll_interval": int(os.getenv("SCAN_POLL_INTERVAL", "15")),
+        },
+        daemon=True,
+        name="B20Scanner"
+    )
     thread.start()
+
 
 class TokenResponse(BaseModel):
     address: str
@@ -133,6 +160,7 @@ class TokenResponse(BaseModel):
     risk_level: str
     liquidity: Optional[str] = None
 
+
 class RiskAnalysisResponse(BaseModel):
     address: str
     risk_score: int
@@ -140,38 +168,42 @@ class RiskAnalysisResponse(BaseModel):
     reasons: List[str]
     details: dict
 
+
+class ChatRequest(BaseModel):
+    query: str
+
+
 @app.get("/")
 async def root():
     return {"message": "B20 Pulse API is live", "docs": "/docs"}
 
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+    return {
+        "status": "ok",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "scanner_output_exists": SCANNER_OUTPUT_PATH.exists()
+    }
+
 
 @app.get("/tokens/recent", response_model=List[TokenResponse])
 async def get_recent_tokens_route(
     limit: int = Query(20, ge=1, le=100),
     meme_only: bool = Query(False)
 ):
-    """HTTP route wrapper — actual logic lives in get_recent_tokens() below
-    so it can be called directly (synchronously) from the Gemini agent too."""
+    """Get recent B20 tokens from scanner output."""
     return get_recent_tokens(limit=limit, meme_only=meme_only)
 
 
 def get_recent_tokens(limit: int = 20, meme_only: bool = False):
     """
-    Returns recent B20 tokens.
-    For MVP we read from a JSON file produced by the scanner.
-    In production: connect to live scanner or database.
-
-    Plain sync function (not a route) so it can be called directly from
-    both the FastAPI route above and the Gemini agent's tool calls.
+    Returns recent B20 tokens from scanner JSON output.
+    Falls back to mock data if no scanner output exists yet.
     """
-    output_path = SCANNER_OUTPUT_PATH
-
-    if not output_path.exists():
-        # Fallback mock data (shown until the background scanner finds real tokens)
-        return [
+    if not SCANNER_OUTPUT_PATH.exists():
+        # Fallback mock data
+        mock = [
             {
                 "address": "0xb200000000000000000000231d6c1f1ce455ba32",
                 "name": "B420",
@@ -182,10 +214,14 @@ def get_recent_tokens(limit: int = 20, meme_only: bool = False):
                 "risk_level": "MEDIUM",
                 "liquidity": "$12.4k"
             }
-        ][:limit]
+        ]
+        return mock[:limit]
 
-    with open(output_path) as f:
-        raw_tokens = json.load(f)
+    try:
+        with open(SCANNER_OUTPUT_PATH) as f:
+            raw_tokens = json.load(f)
+    except Exception as e:
+        return [{"error": f"Failed to read scanner output: {e}"}]
 
     tokens = [_transform_scanner_token(t) for t in raw_tokens]
 
@@ -194,13 +230,9 @@ def get_recent_tokens(limit: int = 20, meme_only: bool = False):
 
     return tokens[:limit]
 
+
 def _lookup_creator_address(address: str) -> Optional[str]:
-    """Look up a token's deployer from the scanner's cached output, if we
-    saw its creation. Needed because B20 renunciation removes
-    DEFAULT_ADMIN_ROLE/MINT_ROLE from the creator outright rather than
-    reassigning them to address(0) — hasRole can only be checked against a
-    specific known address, and the scanner is the only place that recorded
-    who that was."""
+    """Look up a token's deployer from scanner output."""
     if not SCANNER_OUTPUT_PATH.exists():
         return None
     try:
@@ -208,6 +240,7 @@ def _lookup_creator_address(address: str) -> Optional[str]:
             raw_tokens = json.load(f)
     except Exception:
         return None
+    
     target = address.lower()
     for t in raw_tokens:
         if t.get("token_address", "").lower() == target:
@@ -216,11 +249,35 @@ def _lookup_creator_address(address: str) -> Optional[str]:
 
 
 def analyze_token_risk_sync(address: str, rpc_url: str = "https://mainnet.base.org") -> dict:
-    """Plain sync function — actual logic lives here so it can be called
-    directly from both the FastAPI route below and the Gemini agent's tool
-    calls, same pattern as get_recent_tokens()."""
+    """
+    Run full on-chain risk analysis for a B20 token.
+    Returns structured risk assessment or error dict.
+    """
+    # Validate address format
+    if not address or len(address) != 42 or not address.lower().startswith("0xb200"):
+        return {
+            "error": f"Invalid B20 address: '{address}'. Must be 42 chars and start with 0xb200...",
+            "address": address,
+            "risk_score": 0,
+            "risk_level": "INVALID",
+            "reasons": ["Address format is invalid"],
+            "details": {}
+        }
+
     creator = _lookup_creator_address(address)
-    return get_risk_score(address, creator_address=creator, rpc_url=rpc_url)
+    
+    try:
+        result = get_risk_score(address, creator_address=creator, rpc_url=rpc_url)
+        return result
+    except Exception as e:
+        return {
+            "error": str(e),
+            "address": address,
+            "risk_score": 0,
+            "risk_level": "ERROR",
+            "reasons": [f"Analysis failed: {str(e)}"],
+            "details": {"traceback": traceback.format_exc()}
+        }
 
 
 @app.get("/tokens/{address}/risk", response_model=RiskAnalysisResponse)
@@ -229,48 +286,60 @@ async def analyze_token_risk(
     rpc: str = Query("https://mainnet.base.org", description="Base RPC URL")
 ):
     """
-    Runs full on-chain risk analysis for a B20 token.
-    This is the core intelligence of B20 Pulse.
+    Run full on-chain risk analysis for a B20 token.
     """
     result = analyze_token_risk_sync(address, rpc_url=rpc)
     
     if "error" in result:
-        return {
-            "address": address,
-            "risk_score": 0,
-            "risk_level": "UNKNOWN",
-            "reasons": [result["error"]],
-            "details": {}
-        }
+        # Return 200 with error details in body, or 400/500 depending on error type
+        if result.get("risk_level") == "INVALID":
+            raise HTTPException(status_code=400, detail=result)
+        raise HTTPException(status_code=500, detail=result)
     
     return result
 
+
 @app.get("/tokens/{address}/state")
 async def get_token_state(address: str, rpc: str = "https://mainnet.base.org"):
-    """Lightweight endpoint that returns raw on-chain state (paused features,
-    supply cap, total supply). Delegates to risk_scorer.get_light_state so
-    there's one source of truth for the B20 ABI instead of a second
-    hand-rolled copy of it here."""
-    return get_light_state(address, rpc_url=rpc)
-
-# TODO: Add endpoint for X sentiment once integrated
-# TODO: Add WebSocket or polling endpoint for live new token alerts
-
-# Gemini Agent Chat Endpoint
-@app.post("/chat")
-async def chat_with_agent(message: dict):
-    """Chat with the B20 Pulse Gemini agent. Supports tool calling + streaming in full version."""
+    """
+    Lightweight endpoint for raw on-chain state.
+    """
+    if not address or len(address) != 42 or not address.lower().startswith("0xb200"):
+        raise HTTPException(status_code=400, detail="Invalid B20 address format")
+    
     try:
+        return get_light_state(address, rpc_url=rpc)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat")
+async def chat_with_agent(request: ChatRequest):
+    """
+    Chat with the B20 Pulse Gemini agent.
+    Non-streaming for API. For streaming, use SSE in production.
+    """
+    try:
+        # Lazy import to avoid circular dependency
         from agent.gemini_agent import run_gemini_agent
         
-        user_query = message.get("query", "")
+        user_query = request.query.strip()
         if not user_query:
-            return {"error": "No query provided"}
+            raise HTTPException(status_code=400, detail="No query provided")
         
-        # For API, we run non-streaming and return full response
-        # For true streaming, use StreamingResponse + SSE in production
         response = run_gemini_agent(user_query, stream=False)
         
-        return {"response": response or "Sorry, I couldn't process that."}
+        if response is None:
+            raise HTTPException(status_code=500, detail="Agent failed to generate response")
+        
+        return {"response": response, "success": True}
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        traceback_str = traceback.format_exc()
+        raise HTTPException(status_code=500, detail={
+            "error": str(e),
+            "traceback": traceback_str,
+            "error_type": type(e).__name__
+        })
