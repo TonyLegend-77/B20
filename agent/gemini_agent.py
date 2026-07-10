@@ -27,8 +27,8 @@ if not GOOGLE_API_KEY:
 client = genai.Client(api_key=GOOGLE_API_KEY)
 
 # Import our project tools
-from backend.risk_scorer import get_risk_score
-from backend.main import get_recent_tokens
+from backend.risk_scorer import get_light_state
+from backend.main import get_recent_tokens, analyze_token_risk_sync
 
 # ============== TOOL DEFINITIONS ==============
 # The new SDK auto-generates schemas from type hints + docstrings,
@@ -52,7 +52,7 @@ def get_b20_risk_analysis(address: str) -> Dict:
     Args:
         address: The B20 token contract address (starts with 0xb200...).
     """
-    return get_risk_score(address)
+    return analyze_token_risk_sync(address)
 
 def search_x_for_token(query: str, hours: int = 6) -> Dict:
     """Search recent X/Twitter discussion and sentiment for a token or narrative.
@@ -70,34 +70,18 @@ def search_x_for_token(query: str, hours: int = 6) -> Dict:
     }
 
 def get_token_live_state(address: str, rpc_url: str = "https://mainnet.base.org") -> Dict:
-    """Get raw, real-time on-chain state for a B20 token: whether it's paused,
-    its supply cap, current total supply, and whether the zero address still
-    holds the admin role. Use this for quick "is it paused / is supply capped /
+    """Get raw, real-time on-chain state for a B20 token: which features
+    (transfer/mint/burn) are currently paused, its supply cap, and current
+    total supply. Use this for quick "is it paused / is supply capped /
     how much has been minted" style questions, as a lighter-weight alternative
-    to the full risk analysis.
+    to the full risk analysis. For admin/mint role renunciation, use
+    get_b20_risk_analysis instead — that requires knowing the creator address.
 
     Args:
         address: The B20 token contract address (starts with 0xb200...).
         rpc_url: Base RPC endpoint to use.
     """
-    from backend.risk_scorer import get_b20_contract
-    from web3 import Web3
-
-    w3 = Web3(Web3.HTTPProvider(rpc_url))
-    contract = get_b20_contract(w3, address)
-
-    try:
-        return {
-            "paused": contract.functions.paused().call(),
-            "supply_cap": contract.functions.supplyCap().call(),
-            "total_supply": contract.functions.totalSupply().call(),
-            "admin_has_role_zero": contract.functions.hasRole(
-                "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "0x0000000000000000000000000000000000000000"
-            ).call(),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    return get_light_state(address, rpc_url=rpc_url)
 
 # ============== SYSTEM PROMPT ==============
 
